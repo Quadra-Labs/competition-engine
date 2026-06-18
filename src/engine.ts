@@ -1,7 +1,7 @@
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import type { DataLayer, JobResult, JobTemplate } from 'quadra-data';
 
-import type { CompetitionConfig, EvalEngine } from './config.js';
+import type { CompetitionConfig, EvalEngineLookup, ResolvedEvalEngine } from './config.js';
 import { Store, type CompetitionBinding, type CompetitionJobRecord } from './store.js';
 import { CompetitionChain } from './onchain.js';
 import {
@@ -44,6 +44,94 @@ export interface FiredRecord {
     detail?: string;
 }
 
+// --- read API DTOs (served over HTTP for the web competitions pages) ---
+
+export type CompetitionStatus = 'upcoming' | 'active' | 'ended';
+
+/** One competition as the web list/detail pages consume it (camelCase API shape, merging the
+ * off-chain binding metadata with the live on-chain object). */
+export interface CompetitionSummary {
+    id: string;
+    title: string;
+    description: string;
+    tag: string;
+    /** 0 = scoring (accumulated [0,100] job scores), 1 = performance (ROI metric). */
+    kind: number;
+    status: CompetitionStatus;
+    /** Original prize pool in QUADRA base units. */
+    prize: number;
+    /** Number of winner slots (length of the on-chain split). */
+    winners: number;
+    threshold: number;
+    startsAt: number;
+    endsAt: number;
+    entrants: number;
+}
+
+export interface LeaderboardRow {
+    agent: string;
+    name: string;
+    category: string;
+    /** Raw on-chain ranking value: accumulated score (scoring) or `PERF_BASE + roi_bps`
+     * (performance). 0 means the agent joined but has no recorded result yet. */
+    total: number;
+    rank: number;
+    /** QUADRA awarded to this agent (ended competitions only, from PrizeAwarded). */
+    awarded?: number;
+    awardRank?: number;
+}
+
+export interface CompetitionRules {
+    kind: number;
+    threshold: number;
+    split: number[];
+    templateId: string;
+    lifetime: string;
+    prediction: boolean;
+    portfolio?: Record<string, number>;
+    params?: Record<string, string>;
+}
+
+export interface CompetitionDetail extends CompetitionSummary {
+    ended: boolean;
+    /** The `metric = PERF_BASE + roi_bps` baseline, so the web decodes ROI without hardcoding. */
+    perfBase: number;
+    leaderboard: LeaderboardRow[];
+    rules: CompetitionRules;
+}
+
+/** The on-chain `Competition` object fields the read API needs (parsed from `getObject`). */
+interface ParsedCompetition {
+    kind: number;
+    prizeBalance: number;
+    threshold: number;
+    endTimeMs: number;
+    split: number[];
+    participants: string[];
+    totalsTableId: string | undefined;
+    ended: boolean;
+}
+
+/** Zero-ROI baseline mirroring `competition::perf_base()` (metric = PERF_BASE + roi_bps). */
+const PERF_BASE = 1_000_000;
+/** Cache window for the served competition reads, so web polling does not hammer the RPC. */
+const READ_TTL_MS = 5_000;
+/** Cache window for resolved agent identities (name/category). */
+const AGENT_TTL_MS = 60_000;
+
+/** Parse a u64-ish JSON-RPC value: a number, a decimal string, or a wrapped Balance/struct
+ * (`{ value }` or `{ fields: { value } }`). Returns 0 when it cannot be read. */
+function num(v: unknown): number {
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') return Number(v) || 0;
+    if (v && typeof v === 'object') {
+        const o = v as Record<string, unknown>;
+        if ('value' in o) return num(o.value);
+        if ('fields' in o) return num((o.fields as Record<string, unknown> | undefined)?.value);
+    }
+    return 0;
+}
+
 /** Parse a lifetime like "5m" / "30s" / "2h" / "1d" into milliseconds (mirrors the engines). */
 export function parseLifetimeMs(lifetime: string): number {
     const m = /^(\d+)\s*(s|m|h|d)$/.exec(lifetime.trim());
@@ -71,6 +159,7 @@ function competitionJobId(competitionId: string, agent: string): string {
 export class CompetitionEngine {
     #dl: DataLayer;
     #config: CompetitionConfig;
+    #evalEngines: EvalEngineLookup;
     #store: Store;
     #chain: CompetitionChain;
     #notifier: AgentNotifier;
@@ -82,10 +171,14 @@ export class CompetitionEngine {
     #enclavePkCache = new Map<string, Uint8Array>();
     // Last good template per id, so a transient Walrus/RPC blip doesn't stop dispatch.
     #templateCache = new Map<string, JobTemplate>();
+    // Short-lived caches for the served read API (list/detail + agent identities).
+    #readCache = new Map<string, { at: number; value: unknown }>();
+    #agentInfoCache = new Map<string, { at: number; info: { name: string; category: string } | undefined }>();
 
-    constructor(dl: DataLayer, config: CompetitionConfig, notifier: AgentNotifier) {
+    constructor(dl: DataLayer, config: CompetitionConfig, notifier: AgentNotifier, evalEngines: EvalEngineLookup) {
         this.#dl = dl;
         this.#config = config;
+        this.#evalEngines = evalEngines;
         this.#notifier = notifier;
         this.#store = new Store(config.redisUrl);
         this.#sui = new SuiJsonRpcClient({
@@ -127,7 +220,7 @@ export class CompetitionEngine {
         // interval), so a competition that ended while the engine was down is released at once.
         void this.#scan();
         console.log(
-            `[competition] started: poll ${this.#config.pollMs}ms, network ${this.#dl.config.network}, ${this.#config.evalEngines.size} eval engine(s)`,
+            `[competition] started: poll ${this.#config.pollMs}ms, network ${this.#dl.config.network}, ${this.#evalEngines.size()} eval engine(s)`,
         );
     }
 
@@ -150,6 +243,208 @@ export class CompetitionEngine {
 
     status(): { fired: FiredRecord[] } {
         return { fired: [...this.#fired.values()] };
+    }
+
+    // --- read API (served over HTTP for the web competitions pages) ---
+
+    /** Public summary of every bound competition (those with web metadata), newest start first. */
+    async listCompetitions(): Promise<CompetitionSummary[]> {
+        return this.#cached('list', READ_TTL_MS, async () => {
+            const ids = await this.#store.boundCompetitions();
+            const summaries = await Promise.all(
+                ids.map(async (id) => {
+                    try {
+                        const binding = await this.#store.getBinding(id);
+                        const obj = await this.#readCompetition(id);
+                        if (!binding || !obj) return null;
+                        return this.#summaryFrom(binding, obj);
+                    } catch (err) {
+                        console.warn(
+                            `[competition] summary ${id} failed: ${err instanceof Error ? err.message : err}`,
+                        );
+                        return null;
+                    }
+                }),
+            );
+            return summaries
+                .filter((c): c is CompetitionSummary => c !== null)
+                .sort((a, b) => b.startsAt - a.startsAt);
+        });
+    }
+
+    /** Full detail for one competition (summary + leaderboard + rules), or null if unknown. */
+    async getCompetition(id: string): Promise<CompetitionDetail | null> {
+        return this.#cached(`detail:${id}`, READ_TTL_MS, async () => {
+            const binding = await this.#store.getBinding(id);
+            if (!binding) return null;
+            const obj = await this.#readCompetition(id);
+            if (!obj) return null;
+            const summary = this.#summaryFrom(binding, obj);
+            const leaderboard = await this.#leaderboard(id, obj);
+            const rules: CompetitionRules = {
+                kind: summary.kind,
+                threshold: summary.threshold,
+                split: obj.split.length > 0 ? obj.split : (binding.split ?? []),
+                templateId: binding.template_id,
+                lifetime: binding.lifetime,
+                prediction: binding.prediction === true,
+                ...(binding.portfolio ? { portfolio: binding.portfolio } : {}),
+                ...(binding.params ? { params: binding.params } : {}),
+            };
+            return { ...summary, ended: obj.ended, perfBase: PERF_BASE, leaderboard, rules };
+        });
+    }
+
+    /** Read + parse the on-chain Competition object (the read API's source of truth for the live
+     * prize, threshold, end time, split, participants, and ended flag). */
+    async #readCompetition(id: string): Promise<ParsedCompetition | null> {
+        const res = await this.#sui.getObject({ id, options: { showContent: true } });
+        const fields = (res.data?.content as { fields?: Record<string, unknown> } | undefined)
+            ?.fields;
+        if (!fields) return null;
+        const totals = fields.totals as { fields?: { id?: { id?: string } } } | undefined;
+        return {
+            kind: num(fields.kind),
+            prizeBalance: num(fields.prize),
+            threshold: num(fields.threshold),
+            endTimeMs: num(fields.end_time_ms),
+            split: Array.isArray(fields.split_pct) ? (fields.split_pct as unknown[]).map(num) : [],
+            participants: Array.isArray(fields.participants)
+                ? (fields.participants as unknown[]).map(String)
+                : [],
+            totalsTableId: totals?.fields?.id?.id,
+            ended: fields.ended === true,
+        };
+    }
+
+    /** Merge the off-chain binding metadata with the on-chain object into a web summary. On-chain
+     * fields win where both exist; `prize` prefers the binding's original pool (the live balance is
+     * drained once prizes are released). */
+    #summaryFrom(binding: CompetitionBinding, obj: ParsedCompetition): CompetitionSummary {
+        const now = Date.now();
+        const startsAt = binding.start_time_ms ?? 0;
+        const endsAt = obj.endTimeMs || binding.end_time_ms;
+        const status: CompetitionStatus =
+            obj.ended || now >= endsAt ? 'ended' : now < startsAt ? 'upcoming' : 'active';
+        const kind = obj.kind;
+        return {
+            id: binding.competition_id,
+            title: binding.title ?? 'Competition',
+            description: binding.description ?? '',
+            tag: binding.tag ?? (kind === KIND_PERFORMANCE ? 'Performance' : 'Scoring'),
+            kind,
+            status,
+            prize: binding.prize ?? obj.prizeBalance,
+            winners: obj.split.length,
+            threshold: obj.threshold,
+            startsAt,
+            endsAt,
+            entrants: obj.participants.length,
+        };
+    }
+
+    /** Rank the per-agent totals (read from the on-chain `totals` Table), resolve agent identities,
+     * and attach awarded prizes for ended competitions. */
+    async #leaderboard(competitionId: string, obj: ParsedCompetition): Promise<LeaderboardRow[]> {
+        if (!obj.totalsTableId) return [];
+        const entries: { agent: string; total: number }[] = [];
+        let cursor: string | null | undefined;
+        for (let page = 0; page < 20; page++) {
+            const res = await this.#sui.getDynamicFields({
+                parentId: obj.totalsTableId,
+                cursor,
+            });
+            const ids = res.data.map((f) => f.objectId);
+            if (ids.length > 0) {
+                const objs = await this.#sui.multiGetObjects({
+                    ids,
+                    options: { showContent: true },
+                });
+                for (const o of objs) {
+                    const f = (
+                        o.data?.content as
+                            | { fields?: { name?: unknown; value?: unknown } }
+                            | undefined
+                    )?.fields;
+                    if (!f || f.name === undefined) continue;
+                    entries.push({ agent: String(f.name), total: num(f.value) });
+                }
+            }
+            if (!res.hasNextPage) break;
+            cursor = res.nextCursor;
+        }
+        // Highest total ranks first; a 0 (joined, no result yet) naturally sorts last.
+        entries.sort((a, b) => b.total - a.total);
+
+        const awards = obj.ended
+            ? await this.#prizeAwards(competitionId)
+            : new Map<string, { amount: number; rank: number }>();
+
+        return Promise.all(
+            entries.map(async (e, i) => {
+                const info = await this.#agentInfo(e.agent);
+                const award = awards.get(e.agent.toLowerCase());
+                return {
+                    agent: e.agent,
+                    name: info?.name ?? '',
+                    category: info?.category ?? '',
+                    total: e.total,
+                    rank: i + 1,
+                    ...(award ? { awarded: award.amount, awardRank: award.rank } : {}),
+                } satisfies LeaderboardRow;
+            }),
+        );
+    }
+
+    /** Awarded prizes per agent for one competition, read from `PrizeAwarded` events. */
+    async #prizeAwards(competitionId: string): Promise<Map<string, { amount: number; rank: number }>> {
+        const out = new Map<string, { amount: number; rank: number }>();
+        const eventType = `${this.#config.quadraPackageId}::competition::PrizeAwarded`;
+        const target = competitionId.toLowerCase();
+        let cursor: { txDigest: string; eventSeq: string } | null | undefined;
+        for (let page = 0; page < 20; page++) {
+            const res = await this.#sui.queryEvents({
+                query: { MoveEventType: eventType },
+                cursor,
+                order: 'ascending',
+                limit: 50,
+            });
+            for (const ev of res.data) {
+                const p = ev.parsedJson as Record<string, unknown>;
+                if (String(p.competition_id).toLowerCase() !== target) continue;
+                out.set(String(p.agent_id).toLowerCase(), {
+                    amount: num(p.amount),
+                    rank: num(p.rank),
+                });
+            }
+            if (!res.hasNextPage) break;
+            cursor = res.nextCursor;
+        }
+        return out;
+    }
+
+    /** Resolve an agent's name/category from the data layer (cached). */
+    async #agentInfo(wallet: string): Promise<{ name: string; category: string } | undefined> {
+        const cached = this.#agentInfoCache.get(wallet);
+        if (cached && Date.now() - cached.at < AGENT_TTL_MS) return cached.info;
+        let info: { name: string; category: string } | undefined;
+        try {
+            const a = await this.#dl.agents.get(wallet);
+            if (a) info = { name: a.name, category: a.category };
+        } catch {
+            info = undefined;
+        }
+        this.#agentInfoCache.set(wallet, { at: Date.now(), info });
+        return info;
+    }
+
+    /** Time-boxed memoization for the served reads. */
+    async #cached<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T> {
+        const hit = this.#readCache.get(key);
+        if (hit && Date.now() - hit.at < ttlMs) return hit.value as T;
+        const value = await fn();
+        this.#readCache.set(key, { at: Date.now(), value });
+        return value;
     }
 
     // --- event handlers ---
@@ -189,6 +484,9 @@ export class CompetitionEngine {
         for (const competitionId of await this.#store.boundCompetitions()) {
             const binding = await this.#store.getBinding(competitionId);
             if (!binding || now >= binding.end_time_ms) continue;
+            // Scheduled competitions stay "upcoming" until their start: dispatch no jobs yet
+            // (agents may still enrol on chain; they just receive nothing before the start).
+            if (binding.start_time_ms !== undefined && now < binding.start_time_ms) continue;
 
             // Read the template, but fall back to the last good copy on a transient Walrus/RPC
             // failure — and never let one competition's fetch error abort dispatch for the rest.
@@ -283,7 +581,7 @@ export class CompetitionEngine {
             }
 
             const evaluatorId = result.job.template.evaluator_id;
-            const engine = this.#config.evalEngines.get(evaluatorId);
+            const engine = this.#evalEngines.get(evaluatorId);
             if (!engine) {
                 console.warn(`[competition] ${jobId}: no eval engine for '${evaluatorId}'`);
                 await this.#finalize(jobId, job.competition_id, 'no_engine', evaluatorId);
@@ -310,7 +608,7 @@ export class CompetitionEngine {
         jobId: string,
         job: CompetitionJobRecord,
         result: JobResult,
-        engine: EvalEngine,
+        engine: ResolvedEvalEngine,
     ): Promise<void> {
         const binding = await this.#store.getBinding(job.competition_id);
 
@@ -357,7 +655,7 @@ export class CompetitionEngine {
         jobId: string,
         job: CompetitionJobRecord,
         result: JobResult,
-        engine: EvalEngine,
+        engine: ResolvedEvalEngine,
     ): Promise<void> {
         const binding = await this.#store.getBinding(job.competition_id);
         const portfolio = binding?.portfolio ?? {};
@@ -388,7 +686,7 @@ export class CompetitionEngine {
     /** Verify an enclave response signature when the engine declares an on-chain enclave id; in
      * dev (no enclave id) trust the response. */
     async #verify(
-        engine: EvalEngine,
+        engine: ResolvedEvalEngine,
         ev: EvalScoreResponse | EvalMetricResponse,
         kind: 'score' | 'metric',
     ): Promise<boolean> {

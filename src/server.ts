@@ -11,6 +11,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 
 import { loadCompetitionConfig, createDataLayer } from './config.js';
+import { createEvalEngineRegistry } from 'quadra-data';
 import { AuthManager } from './auth.js';
 import { createNotifier } from './notify.js';
 import { CompetitionEngine } from './engine.js';
@@ -56,6 +57,25 @@ function parseBinding(id: string, body: unknown): CompetitionBinding | { error: 
               )
             : undefined;
 
+    // Off-chain presentation + scheduling metadata (all optional).
+    const startTime = b.start_time_ms !== undefined ? Number(b.start_time_ms) : undefined;
+    if (startTime !== undefined && (!Number.isFinite(startTime) || startTime < 0)) {
+        return { error: 'start_time_ms must be a non-negative number' };
+    }
+    if (startTime !== undefined && startTime >= endTime) {
+        return { error: 'start_time_ms must be before end_time_ms' };
+    }
+    const str = (v: unknown): string | undefined =>
+        typeof v === 'string' && v.length > 0 ? v : undefined;
+    const finiteNum = (v: unknown): number | undefined =>
+        v !== undefined && Number.isFinite(Number(v)) ? Number(v) : undefined;
+    const split =
+        Array.isArray(b.split) && b.split.every((n) => Number.isFinite(Number(n)))
+            ? (b.split as unknown[]).map((n) => Number(n))
+            : undefined;
+    const prize = finiteNum(b.prize);
+    const threshold = finiteNum(b.threshold);
+
     return {
         competition_id: id,
         kind,
@@ -65,20 +85,43 @@ function parseBinding(id: string, body: unknown): CompetitionBinding | { error: 
         ...(params && Object.keys(params).length > 0 ? { params } : {}),
         ...(portfolio && Object.keys(portfolio).length > 0 ? { portfolio } : {}),
         ...(b.prediction === true ? { prediction: true } : {}),
+        ...(startTime !== undefined ? { start_time_ms: startTime } : {}),
+        ...(str(b.title) ? { title: str(b.title) } : {}),
+        ...(str(b.description) ? { description: str(b.description) } : {}),
+        ...(str(b.tag) ? { tag: str(b.tag) } : {}),
+        ...(prize !== undefined ? { prize } : {}),
+        ...(threshold !== undefined ? { threshold } : {}),
+        ...(split && split.length > 0 ? { split } : {}),
     };
 }
 
 async function main(): Promise<void> {
     const config = loadCompetitionConfig();
     const dl = createDataLayer();
+    const evalEngines = createEvalEngineRegistry(dl);
+    await evalEngines.start();
     const auth = new AuthManager(dl, config.authWindowMs);
 
     const app = express();
     app.use(express.json());
 
+    // Allow the web app to read the competition endpoints from the browser. Reads are public, so
+    // a permissive default origin is fine; tighten it with COMPETITION_CORS_ORIGIN in production.
+    const corsOrigin = process.env.COMPETITION_CORS_ORIGIN ?? '*';
+    app.use((req, res, next) => {
+        res.header('Access-Control-Allow-Origin', corsOrigin);
+        res.header('Access-Control-Allow-Headers', 'content-type, x-competition-admin');
+        res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
+        if (req.method === 'OPTIONS') {
+            res.sendStatus(204);
+            return;
+        }
+        next();
+    });
+
     const httpServer = createServer(app);
     const notifier = createNotifier(httpServer, auth);
-    const engine = new CompetitionEngine(dl, config, notifier);
+    const engine = new CompetitionEngine(dl, config, notifier, evalEngines);
     engine.start();
 
     // The create-competition CLI registers a competition's off-chain binding here.
@@ -116,6 +159,35 @@ async function main(): Promise<void> {
 
     app.get('/health', (_req, res) => res.json({ ok: true, network: dl.config.network }));
     app.get('/status', (_req, res) => res.json(engine.status()));
+
+    // Public read API for the web competitions pages (list + detail).
+    app.get('/competitions', (_req, res) => {
+        engine
+            .listCompetitions()
+            .then((competitions) => res.json({ competitions }))
+            .catch((err) =>
+                res.status(500).json({ error: err instanceof Error ? err.message : 'list failed' }),
+            );
+    });
+    app.get('/competitions/:id', (req, res) => {
+        const id = req.params.id;
+        if (!id) {
+            res.status(400).json({ error: 'competition id is required' });
+            return;
+        }
+        engine
+            .getCompetition(id)
+            .then((competition) => {
+                if (!competition) {
+                    res.status(404).json({ error: 'unknown competition' });
+                    return;
+                }
+                res.json(competition);
+            })
+            .catch((err) =>
+                res.status(500).json({ error: err instanceof Error ? err.message : 'detail failed' }),
+            );
+    });
 
     httpServer.listen(config.port, () => {
         console.log(

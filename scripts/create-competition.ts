@@ -12,6 +12,11 @@
 //   npm run create-competition -- --kind scoring --prize 1000000 --threshold 1 \
 //       --in 1h --split 100 --template polymarket-resolution --lifetime 30m \
 //       --prediction --params market_id:507033   (event_id / market_id+target_ts for the others)
+//
+// Web metadata + scheduling (all optional; stored off-chain on the engine, since the contract has
+// no start time or title): --title "BTC Sprint" --description "..." --tag "Price prediction"
+//   --starts-in 2d   (or --start <epoch_ms>) schedules a future start: the competition shows as
+//   "upcoming" and the engine dispatches no jobs until then. Defaults to starting immediately.
 
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from "@mysten/sui/jsonRpc";
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
@@ -83,6 +88,25 @@ async function main(): Promise<void> {
   const threshold = args.threshold !== undefined ? Number(args.threshold) : kind === 1 ? 1_000_000 : 1;
   const split = parseSplit(args.split ?? "100");
   const endMs = args.end !== undefined ? Number(args.end) : Date.now() + parseDurationMs(args.in ?? "10m");
+  // Off-chain schedule: when the competition opens. Defaults to now (live immediately); a future
+  // start makes it "upcoming" and defers job dispatch until then.
+  const startMs =
+    args.start !== undefined
+      ? Number(args.start)
+      : args["starts-in"] !== undefined
+        ? Date.now() + parseDurationMs(args["starts-in"])
+        : Date.now();
+  if (!Number.isFinite(startMs) || startMs < 0) {
+    console.error("--start must be epoch ms (or use --starts-in <e.g. 2d>).");
+    process.exit(1);
+  }
+  if (startMs >= endMs) {
+    console.error("Competition start must be before its end (check --start/--starts-in vs --in/--end).");
+    process.exit(1);
+  }
+  const title = args.title;
+  const description = args.description;
+  const tag = args.tag;
   const portfolio = args.portfolio !== undefined ? parseKeyNums(args.portfolio) : undefined;
   const params = args.params !== undefined ? parseKeyStrs(args.params) : undefined;
   // Prediction-market (polymarket) scoring competitions: the engine resolves from Polymarket via
@@ -146,7 +170,8 @@ async function main(): Promise<void> {
     throw new Error("competition created but its object id was not found in objectChanges");
   }
   const competitionId = created.objectId;
-  console.log(`Created competition ${competitionId} (kind ${kindStr}, prize ${prize}, ends ${new Date(endMs).toISOString()}).`);
+  const schedule = startMs > Date.now() + 1000 ? `starts ${new Date(startMs).toISOString()}, ` : "";
+  console.log(`Created competition ${competitionId} (kind ${kindStr}, prize ${prize}, ${schedule}ends ${new Date(endMs).toISOString()}).`);
   console.log(`  tx: ${res.digest}`);
 
   // Tell the engine the off-chain binding so it can dispatch + resolve.
@@ -160,6 +185,14 @@ async function main(): Promise<void> {
     template_id: templateId,
     lifetime,
     end_time_ms: Math.floor(endMs),
+    start_time_ms: Math.floor(startMs),
+    // Display copies so the web shows the full pool/threshold/split even after release.
+    prize,
+    threshold,
+    split,
+    ...(title ? { title } : {}),
+    ...(description ? { description } : {}),
+    ...(tag ? { tag } : {}),
     ...(params ? { params } : {}),
     ...(portfolio ? { portfolio } : {}),
     ...(prediction ? { prediction: true } : {}),

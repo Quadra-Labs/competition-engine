@@ -21,6 +21,21 @@ export interface CompetitionBinding {
      * Polymarket using `params`, so the engine skips the Pyth start-price capture and sends a
      * prediction payload instead of the finance one. Defaults to false (finance scoring). */
     prediction?: boolean;
+    // --- presentational + scheduling metadata (set by the admin create script; off-chain only,
+    // since the contract has no start time, title, or description) ---
+    /** When the competition opens (epoch ms). Before this it reads as "upcoming" on the web and the
+     * engine dispatches no jobs. Defaults to the creation time (live immediately) when omitted. */
+    start_time_ms?: number;
+    /** Display title, blurb, and a short category/type label for the web competitions pages. */
+    title?: string;
+    description?: string;
+    tag?: string;
+    /** Original prize pool (QUADRA base units), winner split, and qualifying threshold, copied
+     * from the create call so the web can show the full pool even after `release_prizes` drains the
+     * on-chain balance. The live contract object stays the source of truth where it is still set. */
+    prize?: number;
+    threshold?: number;
+    split?: number[];
 }
 
 /** One dispatched free job (one per agent per competition). */

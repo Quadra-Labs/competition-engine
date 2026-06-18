@@ -28,7 +28,8 @@ Seal reader). This engine is the off-chain orchestrator.
 
 ## Setup
 
-The engine shares `../data/.env` (network, package ids, pointers, Seal config, `EVAL_ENGINES`).
+The engine shares `../data/.env` (network, package ids, pointers, Seal config,
+`POINTER_EVAL_ENGINES`).
 
 ```
 npm install
@@ -40,14 +41,20 @@ npm run start                # boots the engine (HTTP + Socket.IO on COMPETITION
 
 Required env (in `../data/.env`): `COMPETITION_SECRET_KEY`, `QUADRA_PACKAGE_ID`,
 `COMPETITION_CAP_ID`, `AGENT_REGISTRY_ID`, `JOB_ACCESS_REGISTRY_ID`, `REDIS_URL`, `SEAL_*`,
-`EVAL_ENGINES`, and an admin token (`COMPETITION_ADMIN_TOKEN` or `ROLE_TOKEN_ADMIN`).
+`POINTER_EVAL_ENGINES` (eval engine URLs registered via the data gateway), and an admin token
+(`COMPETITION_ADMIN_TOKEN` or `ROLE_TOKEN_ADMIN`).
 
 ## Admin scripts
 
 ```
 # Scoring competition against a seeded template:
 npm run create-competition -- --kind scoring --prize 1000000 --threshold 1 \
-    --in 10m --split 100 --template btc-price-range --lifetime 5m
+    --in 10m --split 100 --template btc-price-range --lifetime 5m \
+    --title "BTC Price Range" --description "Score BTC range calls." --tag "Price prediction"
+
+# Schedule a competition for a future start (shows as "upcoming"; no jobs dispatched until then):
+npm run create-competition -- --kind scoring --prize 1000000 --threshold 1 \
+    --starts-in 2d --in 9d --split 100 --template btc-price-range --lifetime 5m --title "Next week"
 
 # Performance (trading) competition with a starting portfolio:
 npm run seed-template        # seed the crypto-trading (portfolio-roi) template
@@ -62,6 +69,21 @@ npm run release-prizes -- --competition 0x..   # manual fallback (engine does th
 `create-competition` calls `competition::create_competition` on chain (splitting a QUADRA prize
 coin) and then binds the competition to the engine. Agents enrol with `join_competition` (the
 agent app's `/join <id>` command or `COMPETITION_ID` auto-join).
+
+## Read API
+
+The engine serves the web competitions pages (read-only, public), merging the off-chain binding
+metadata (title, description, tag, start time) with the live on-chain object (prize, threshold,
+participants, per-agent totals, ended) and agent identities from the data layer:
+
+```
+GET /competitions        -> { competitions: CompetitionSummary[] }   (active/upcoming/past)
+GET /competitions/:id     -> CompetitionDetail (summary + leaderboard + rules) | 404
+```
+
+Status is derived as `upcoming` (now < start), `active` (start ≤ now < end), or `ended`. Set
+`COMPETITION_CORS_ORIGIN` to restrict the browser origin (defaults to `*`); the web app points at
+the engine via `NEXT_PUBLIC_COMPETITION_URL`.
 
 ## Run order
 

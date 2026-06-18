@@ -4,6 +4,8 @@ import { Agent, setGlobalDispatcher } from 'undici';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { DataLayer } from 'quadra-data';
 
+export type { EvalEngineLookup, ResolvedEvalEngine } from 'quadra-data';
+
 // Generous connect timeout for public Sui/Walrus endpoints. We do NOT pin family:4 here: on a
 // long-running process, forcing IPv4 was making outbound fetches intermittently "fetch failed";
 // letting Node auto-select the family (Happy Eyeballs) is more reliable.
@@ -17,14 +19,6 @@ try {
     process.loadEnvFile(envPath);
 } catch {
     // env may already be provided by the parent process (e.g. a spawned child)
-}
-
-/** Where to reach (and how to verify) one evaluation engine. Mirrors the scheduler's shape. */
-export interface EvalEngine {
-    /** Base URL of the enclave / its backend (POST /process_data). */
-    url: string;
-    /** On-chain `enclave::Enclave` object id. Omit to skip signature verification (local dev). */
-    enclaveId?: string;
 }
 
 export interface CompetitionConfig {
@@ -44,8 +38,6 @@ export interface CompetitionConfig {
     pollMs: number;
     /** Allowed clock skew on a signed agent socket handshake (default 60s). */
     authWindowMs: number;
-    /** evaluator_id -> evaluation engine (scoring scorer + the portfolio-roi evaluator). */
-    evalEngines: Map<string, EvalEngine>;
 }
 
 function required(name: string): string {
@@ -73,29 +65,7 @@ export function loadCompetitionConfig(): CompetitionConfig {
         port: num('COMPETITION_PORT', 5100),
         pollMs: num('COMPETITION_POLL_MS', 3000),
         authWindowMs: num('COMPETITION_AUTH_WINDOW_MS', 60_000),
-        evalEngines: loadEvalEngines(),
     };
-}
-
-/** Parse `EVAL_ENGINES` (a JSON object `evaluator_id -> { url, enclave_id? }`). Shared shape
- * with the scheduler; the portfolio-roi evaluator is just another entry. */
-function loadEvalEngines(): Map<string, EvalEngine> {
-    const raw = process.env.EVAL_ENGINES;
-    if (!raw) return new Map();
-    let parsed: Record<string, { url: string; enclave_id?: string }>;
-    try {
-        parsed = JSON.parse(raw);
-    } catch (error) {
-        throw new Error(
-            `EVAL_ENGINES is not valid JSON: ${error instanceof Error ? error.message : error}`,
-        );
-    }
-    return new Map(
-        Object.entries(parsed).map(([id, e]) => [
-            id,
-            { url: e.url, ...(e.enclave_id ? { enclaveId: e.enclave_id } : {}) },
-        ]),
-    );
 }
 
 /** Read-only data layer (no master key); the engine reads templates + Seal-decrypts results. */

@@ -1,1 +1,6 @@
 node_modules/
+
+# Local env (may hold a private key); keep the example tracked.
+.env
+.env.*
+!.env.example
