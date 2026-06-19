@@ -10,6 +10,8 @@
 // split. Every template MUST declare non-empty `params` or the agent parser skips it as not
 // intake-ready, even though competitions pre-fill the params.
 
+import { fileURLToPath } from "node:url";
+
 const TEMPLATES = [
   {
     id: "polymarket-resolution",
@@ -58,7 +60,7 @@ function loadDotEnv(): void {
   const loader = (process as { loadEnvFile?: (path?: string) => void }).loadEnvFile;
   if (typeof loader !== "function") return;
   // Engines share data/.env (two levels up from competition/scripts).
-  for (const path of [new URL("../../data/.env", import.meta.url).pathname, ".env"]) {
+  for (const path of [fileURLToPath(new URL("../../data/.env", import.meta.url)), ".env"]) {
     try {
       loader(path);
     } catch {
