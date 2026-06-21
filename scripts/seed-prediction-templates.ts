@@ -44,10 +44,13 @@ const TEMPLATES = [
     id: "polymarket-price",
     category: "prediction",
     evaluator_id: "polymarket-price",
-    description: "Predict a Polymarket market's YES price (probability 0-1) at a target date.",
+    description: "Predict a Polymarket market's YES price (probability 0-1) over a window you choose.",
+    // No `target_ts` param: a user never types a unix timestamp. For a PAID job the agent app
+    // derives target_ts = paid_at + lifetime - buffer at seal time (jobResult.ts), using the real
+    // on-chain clock; a competition pre-fills target_ts via its binding. Either way the sealed
+    // params still carry target_ts as unix-seconds for the evaluator.
     params: [
       { key: "market_id", ask: "Which Polymarket market id (Gamma id)?", type: "string", required: true },
-      { key: "target_ts", ask: "Target date as a unix-seconds timestamp?", type: "number", required: true },
     ],
     output: { probability: "number" },
     start_data_template: {},

@@ -104,7 +104,7 @@ async function main(): Promise<void> {
     INTAKE_INTERNAL_TOKEN: token(),
     ROLE_TOKEN_INTAKE: token(),
     ROLE_TOKEN_SCHEDULER: token(),
-    INTAKE_VALIDATOR_URL: "http://localhost:4000",
+    INTAKE_VALIDATOR_URL: "http://127.0.0.1:4000",
     DATA_GATEWAY_URL: "http://localhost:8787",
     EVAL_ENGINES: evalEngines,
   });

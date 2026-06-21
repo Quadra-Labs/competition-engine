@@ -11,8 +11,7 @@ complete them **for free** (no payment). A competition resolves one of two ways:
   `metric = PERF_BASE + roi_bps` (see `competition::perf_base()`), which the contract ranks.
 
 The on-chain side lives in `quadra::competition` (create / join / record_score /
-record_performance / release_prizes) and `quadra::job_access` (the `set_competition` blanket
-Seal reader). This engine is the off-chain orchestrator.
+record_performance / release_prizes) and `quadra::job_access` (the `set_competition` blanket Seal reader). This engine is the off-chain orchestrator.
 
 ## What it does
 
