@@ -4,6 +4,7 @@ import type { DataLayer, JobResult, JobTemplate } from 'quadra-data';
 import type { CompetitionConfig, EvalEngineLookup, ResolvedEvalEngine } from './config.js';
 import { Store, type CompetitionBinding, type CompetitionJobRecord } from './store.js';
 import { CompetitionChain } from './onchain.js';
+import { resolveRpcUrl, retryingRpcTransport } from './rpcRetry.js';
 import {
     EventWatcher,
     decodeAgentJoined,
@@ -182,7 +183,7 @@ export class CompetitionEngine {
         this.#notifier = notifier;
         this.#store = new Store(config.redisUrl);
         this.#sui = new SuiJsonRpcClient({
-            url: process.env.DATA_BASE_URL ?? getJsonRpcFullnodeUrl(dl.config.network),
+            transport: retryingRpcTransport(resolveRpcUrl(getJsonRpcFullnodeUrl(dl.config.network))),
             network: dl.config.network,
         });
         this.#chain = new CompetitionChain({
