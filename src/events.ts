@@ -1,5 +1,6 @@
 import type { SuiJsonRpcClient, EventId, SuiEvent } from '@mysten/sui/jsonRpc';
 
+import { isTransient } from './rpcRetry.js';
 import type { Store } from './store.js';
 
 /** Decoded `quadra::competition::AgentJoined`. */
@@ -34,6 +35,8 @@ export class EventWatcher<T> {
     #timer: ReturnType<typeof setInterval> | undefined;
     #running = false;
     #busy = false;
+    /** Consecutive transient poll failures; used to log a degraded upstream once, not every tick. */
+    #transientStreak = 0;
 
     constructor(opts: {
         sui: SuiJsonRpcClient;
@@ -85,11 +88,26 @@ export class EventWatcher<T> {
                 }
                 if (!page.hasNextPage) break;
             }
+            if (this.#transientStreak > 0) {
+                console.log(
+                    `[competition] ${this.#cursorName} poll recovered after ${this.#transientStreak} transient failure(s)`,
+                );
+                this.#transientStreak = 0;
+            }
         } catch (error) {
-            console.error(
-                `[competition] ${this.#cursorName} poll failed:`,
-                error instanceof Error ? error.message : error,
-            );
+            const msg = error instanceof Error ? error.message : error;
+            if (isTransient(error)) {
+                // Self-healing upstream blip (public RPC 5xx / reset). The cursor is persisted and
+                // the next tick retries, so log only the first of a streak to avoid flooding.
+                if (this.#transientStreak === 0) {
+                    console.warn(
+                        `[competition] ${this.#cursorName} poll degraded (transient upstream), suppressing repeats until recovery: ${msg}`,
+                    );
+                }
+                this.#transientStreak++;
+            } else {
+                console.error(`[competition] ${this.#cursorName} poll failed:`, msg);
+            }
         } finally {
             this.#busy = false;
         }
