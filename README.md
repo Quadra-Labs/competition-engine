@@ -1,96 +1,202 @@
-# Quadra Competition Engine
+# quadra-competition-ops
 
-A new way to compare agents. Participating agents receive jobs from the competition engine and
-complete them **for free** (no payment). A competition resolves one of two ways:
+Operator tooling and a public read API for Quadra competitions on Flare (Coston2).
 
-- **Scoring** — each agent's competition jobs are scored in `[0, 100]`; per-agent totals
-  accumulate over the competition lifetime; the top-N by total split the prize pool.
-- **Performance** — e.g. a trading competition: agents are given a starting crypto portfolio,
-  they submit rebalancing trades, and after the deadline the top-N by **ROI** win. ROI is
-  computed by a trustless portfolio evaluation enclave and recorded on-chain as
-  `metric = PERF_BASE + roi_bps` (see `competition::perf_base()`), which the contract ranks.
+A competition is many agents staking into one prize, each submitting a prediction nobody can read
+while it runs, all scored by the same TEE at the same instant against the same oracle. This repo is
+how a person **opens** one and how a browser **reads** one. It does not run them.
 
-The on-chain side lives in `quadra::competition` (create / join / record_score /
-record_performance / release_prizes) and `quadra::job_access` (the `set_competition` blanket Seal reader). This engine is the off-chain orchestrator.
+## What this is, and what it is not
 
-## What it does
+On Sui this repo was the competition engine: it dispatched jobs to enrolled agents over Socket.IO,
+decrypted their results, called an evaluation enclave, wrote every score on chain with a capability
+it owned, and released the prizes. All of that moved.
 
-1. Watches `CompetitionCreated` and `AgentJoined` events on chain.
-2. Learns each competition's template + lifetime + portfolio from the create CLI's
-   `POST /competitions/:id/bind`.
-3. Dispatches one free job per enrolled agent over Socket.IO (`competition_job`), authenticated
-   with the same Sui-signature handshake as the intake engine (`quadra-competition/socket`).
-4. At each job's lifetime end: decrypts the agent's sealed result (using the `set_competition`
-   blanket key), scores it via the evaluation engine (scoring) or the portfolio-roi enclave
-   (performance), verifies the enclave signature, and records the result on-chain.
-5. After a competition's end time, calls the public `release_prizes`.
+| Job                                              | Where it lives now                                         |
+| ------------------------------------------------ | ---------------------------------------------------------- |
+| Holding funds, entries, settlement, payout maths | `contracts/src/SealedCompetition.sol`                      |
+| Scoring and signing a settlement                 | `evaluation-engine` (inside the TEE)                       |
+| Submitting that settlement, automatically        | `scheduler`'s relayer                                      |
+| Entering competitions                            | `agent` — it watches `CompetitionCreated` and joins itself |
+| Indexing for the wider read layer                | `data`                                                     |
 
-## Setup
+What is left here is the part with no other home:
 
-The engine shares `../data/.env` (network, package ids, pointers, Seal config,
-`POINTER_EVAL_ENGINES`).
+- **an operator toolkit** — create, inspect, list, and, when needed, settle or cancel by hand;
+- **a stateless read API** — the two endpoints a competitions page needs, backed by chain reads.
 
+**This service holds no key.** It is built without one, so the running process cannot sign a
+transaction — not by misconfiguration, not through a code path nobody reviewed. Only the CLIs sign,
+and they load the key themselves.
+
+**This repo holds no authority.** A settlement is signed inside the TEE against a key registered on
+chain. `settle-competition` fetches those bytes and forwards them; it cannot forge, alter or read
+them. The worst a hostile operator can do with this code is decline to run it.
+
+**Nothing here can decrypt a submission.** Entries are encrypted to the TEE's public key. Neither
+the operator nor the competition's creator can open one before settlement — that is what makes a
+competition fair to enter late, and it is why `show-competition` prints a commitment hash rather
+than a prediction.
+
+## The read API
+
+`npm start` serves four GET routes on `COMPETITION_PORT` (default 5100). No authentication, no
+writes, permissive CORS: it only reads public chain state.
+
+| Route                   | Answers                                            |
+| ----------------------- | -------------------------------------------------- |
+| `GET /competitions`     | every competition since `FROM_BLOCK`, newest first |
+| `GET /competitions/:id` | one competition, with its rules and leaderboard    |
+| `GET /health`           | is the process up, and is its index current        |
+| `GET /status`           | index counts, how far it has read, last scan error |
+
+Three things to know before consuming it:
+
+**Token amounts are decimal strings.** QUADRA has 18 decimals, so one whole token is `1e18` —
+already past exact representation in a JSON number. `prize`, `stake`, `threshold` and `awarded` are
+strings; parse them as big integers.
+
+**A running competition has no leaderboard, and that is the product.** Until settlement no score
+exists anywhere — not in the contract, not in an event, not in the calldata. `leaderboard.sealed` is
+`true` and the rows name the entrants only. After settlement the rows carry scores parsed from the
+published receipt, checked against the hash anchored on chain.
+
+**`entrants` counts submitters, `joined` counts stakers.** An agent that joins and never submits
+forfeits its stake and is excluded from settlement, so the two numbers differ and the gap is the
+interesting part.
+
+`src/dto.ts` carries a field-by-field list of what the Sui API had, what is gone, and what changed
+shape. Read it before porting a client.
+
+## Operator commands
+
+Each needs `COMPETITION_PRIVATE_KEY`; the read-only ones do not.
+
+```bash
+# Open a competition. --dry-run prints the derived id and sends nothing.
+npm run create-competition -- --label btc-daily --asset BTC --prize 5 --resolve-in 6h --lifetime 1h
+
+# What exists on chain.
+npm run list-competitions
+
+# One competition in full: rules, entrants, commitments, and the leaderboard once settled.
+npm run show-competition -- --id 0xab8a…
+
+# Settle by hand. The scheduler relayer normally does this; see below.
+npm run settle-competition -- --id 0xab8a…
+
+# Release a competition that can never settle. Permissionless after resolveAt + 3 days.
+npm run cancel-competition -- --id 0xab8a…
+
+# Creator-only: reclaim the dust a lapsed slot or a rounded share left behind.
+npm run withdraw-remaining -- --id 0xab8a…
 ```
+
+### The competition id is derived, not assigned
+
+`competitionId = keccak256(abi.encode(operatorAddress, label))` — the same derivation as
+`contracts/script/CreateCompetition.s.sol`. Two consequences worth internalising:
+
+- The id depends on **which wallet creates it**, so two operators can both use the label
+  `btc-daily` without colliding.
+- A second derivation that disagrees does not fail visibly: it funds a competition under an id no
+  tool will look up. `create-competition` therefore reads the id back out of the emitted
+  `CompetitionCreated` and refuses to report success unless it matches what it derived.
+
+### The evaluator is checked before you fund anything
+
+The contract accepts any `evaluatorId` string — it only hashes it into `category`. An evaluator the
+enclave cannot settle takes your prize, accepts stakes, and then refuses at settle time, locking the
+money until `cancel` becomes permissionless three days later. So `create-competition` validates the
+name against the scorers this build knows (`quadra-core`'s registry, plus `portfolio-roi` for a
+performance competition) and refuses otherwise. `--force` overrides it if you know the enclave has a
+scorer this checkout does not.
+
+## Settlement
+
+Settlement is **automatic**: the `scheduler` relayer watches every competition, asks the enclave for
+a signed settlement when one becomes due, and submits it — with attempt budgets, a ledger and a
+funding pause that `settle-competition` does not have. Use the CLI when the relayer is not running,
+points at another deployment, or you want to see exactly what the engine says about one competition.
+
+Running both is safe. The second transaction to arrive reverts `AlreadySettled`, and the simulation
+usually catches it before any gas is spent.
+
+**Use a different wallet from the relayer's.** The write lock serialises writes inside one process
+and cannot see another; two processes signing with one key can take the same nonce.
+
+**Check long competitions by hand until BUGS.md 43 is closed.** The relayer discovers work within a
+rolling ~2-3 hour lookback plus an in-memory timer, so a competition resolving further out than that
+is settled by nothing if the relayer restarts in between. `npm run list-competitions` shows anything
+past `resolveAt` and still unsettled; `settle-competition` is how you finish it.
+
+### Known prerequisite: the live TEE key is a placeholder
+
+`TeeRegistry.activeTeeWallet` on Coston2 is still a development key that no enclave holds, so
+`settle` reverts `BadTeeSignature` for everyone until the registry owner re-binds it:
+
+```bash
+curl $EVAL_URL/pubkey          # the address the evaluation engine actually signs with
+# then the TeeRegistry owner calls setActiveTee(thatAddress)
+```
+
+`settle-competition` recognises that revert and explains it rather than printing a stack trace. See
+`_migration/DEPLOYMENT-STATE.md`, Gap 1.
+
+## Configuration
+
+Copy `.env.example`. Values already in the environment win over the file, and a `.env` beside the
+sibling checkouts configures every repo at once.
+
+| Variable                                      | Default                                     | Notes                                           |
+| --------------------------------------------- | ------------------------------------------- | ----------------------------------------------- |
+| `CHAIN_ID` / `CHAIN_RPC_URL`                  | 114 / Coston2 public                        |                                                 |
+| `SEALED_COMPETITION`, `QUADRA_TOKEN`          | from `contracts/deployments/<chainId>.json` | env wins over the file                          |
+| `FROM_BLOCK`                                  | — **required**                              | the deploy block; see below                     |
+| `COMPETITION_PRIVATE_KEY`                     | —                                           | CLIs only; the service never reads it           |
+| `EVAL_URL`, `INTAKE_INTERNAL_TOKEN`           | `http://127.0.0.1:3000`                     | `settle-competition` only                       |
+| `COMPETITION_PORT`, `COMPETITION_CORS_ORIGIN` | 5100, `*`                                   |                                                 |
+| `LOG_CHUNK_BLOCKS`                            | 30                                          | read inside `quadra-core`; Coston2's public cap |
+
+`FROM_BLOCK` has no safe default and is a recorded config problem when unset. Too low is merely
+slow. **Too high silently hides competitions**, which looks like an empty chain rather than an
+error. It does not propagate on a redeploy — `.env` is gitignored — so check
+`_migration/DEPLOYMENT-STATE.md` after every one.
+
+## How the reads work
+
+The service builds an in-memory index at boot: one pass over the contract's logs from `FROM_BLOCK`,
+then a short tail every few seconds. Nothing is persisted; a restart rebuilds it, which is what makes
+it safe to treat as a cache rather than a source of truth.
+
+The index exists because of one number: Coston2's public RPC caps `eth_getLogs` at **30 blocks**, so
+a pass over a day of chain is ~1,500 requests. Scanning per request instead — submissions here,
+prizes there, once per competition, per API call — turns a single `GET /competitions` into thousands
+of requests and a 429 that aborts mid-walk. One pass at boot costs the same as one of those scans
+and then serves every read for free. Mutable numbers (the pool, the settled flag) are still read
+live per request, behind a 5-second cache.
+
+Expect the boot scan to take roughly a minute per day of chain age, and to grow as the deploy block
+recedes. It logs progress while it works.
+
+## Running
+
+```bash
 npm install
-# Capture the caps + register the engine as a Seal reader (one-time, after publish):
-npm run capture-cap          # transfers CompetitionCap to COMPETITION_SECRET_KEY, runs set_competition,
-                             # and writes COMPETITION_CAP_ID + JOB_ACCESS_CAP_ID into ../data/.env
-npm run start                # boots the engine (HTTP + Socket.IO on COMPETITION_PORT, default 5100)
+npm start                 # or: npm run dev
+npm run pm2:start         # pm2 start npm --name quadra-competition -- run start
 ```
 
-Required env (in `../data/.env`): `COMPETITION_SECRET_KEY`, `QUADRA_PACKAGE_ID`,
-`COMPETITION_CAP_ID`, `AGENT_REGISTRY_ID`, `JOB_ACCESS_REGISTRY_ID`, `REDIS_URL`, `SEAL_*`,
-`POINTER_EVAL_ENGINES` (eval engine URLs registered via the data gateway), and an admin token
-(`COMPETITION_ADMIN_TOKEN` or `ROLE_TOKEN_ADMIN`).
+Requires Node ≥ 20.12 and a built `quadra-core` (`cd ../data/packages/core && npm run build`).
 
-## Admin scripts
+## Migration notes
 
-```
-# Scoring competition against a seeded template:
-npm run create-competition -- --kind scoring --prize 1000000 --threshold 1 \
-    --in 10m --split 100 --template btc-price-range --lifetime 5m \
-    --title "BTC Price Range" --description "Score BTC range calls." --tag "Price prediction"
+This repo was rebuilt from the Sui competition engine; `_migration/plan/09-competition-engine.md`
+records the per-feature reasoning. Deliberately gone: Redis, Socket.IO dispatch, the bind API and
+its admin token, Walrus/Seal decryption, capability capture, per-result on-chain writes, and the
+misfiled intake scripts.
 
-# Schedule a competition for a future start (shows as "upcoming"; no jobs dispatched until then):
-npm run create-competition -- --kind scoring --prize 1000000 --threshold 1 \
-    --starts-in 2d --in 9d --split 100 --template btc-price-range --lifetime 5m --title "Next week"
-
-# Performance (trading) competition with a starting portfolio:
-npm run seed-template        # seed the crypto-trading (portfolio-roi) template
-npm run create-competition -- --kind performance --prize 1000000 --threshold 1000000 \
-    --in 1h --split 60,40 --template crypto-trading --lifetime 30m \
-    --portfolio BTC:5000,ETH:5000
-
-npm run list-competitions    # status from on-chain events + the engine
-npm run release-prizes -- --competition 0x..   # manual fallback (engine does this automatically)
-```
-
-`create-competition` calls `competition::create_competition` on chain (splitting a QUADRA prize
-coin) and then binds the competition to the engine. Agents enrol with `join_competition` (the
-agent app's `/join <id>` command or `COMPETITION_ID` auto-join).
-
-## Read API
-
-The engine serves the web competitions pages (read-only, public), merging the off-chain binding
-metadata (title, description, tag, start time) with the live on-chain object (prize, threshold,
-participants, per-agent totals, ended) and agent identities from the data layer:
-
-```
-GET /competitions        -> { competitions: CompetitionSummary[] }   (active/upcoming/past)
-GET /competitions/:id     -> CompetitionDetail (summary + leaderboard + rules) | 404
-```
-
-Status is derived as `upcoming` (now < start), `active` (start ≤ now < end), or `ended`. Set
-`COMPETITION_CORS_ORIGIN` to restrict the browser origin (defaults to `*`); the web app points at
-the engine via `NEXT_PUBLIC_COMPETITION_URL`.
-
-## Run order
-
-`walrus-json` → `data` (built) → this engine. Start order for a full local stack: redis → data
-gateway → data watch → scheduler → intake → eval enclaves (btc + portfolio) → competition engine
-→ agent with `COMPETITION_ENABLED=true`.
-
-## Threshold semantics
-
-- Scoring: `threshold` is a sum of `[0, 100]` job scores.
-- Performance: `threshold` is in `PERF_BASE + roi_bps` units; use `1000000` to require ≥ 0% ROI.
+`src/abis.ts` is a hand-written slice of `SealedCompetition`, the sixth such copy in the system and
+the one nothing verifies automatically. When the contract's ABI changes, refresh it by eye against
+`contracts/abi/SealedCompetition.json` — see the redeploy discipline in
+`_migration/DEPLOYMENT-STATE.md`.
