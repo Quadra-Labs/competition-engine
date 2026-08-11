@@ -8,13 +8,18 @@
         "strict": true,
         "noUncheckedIndexedAccess": true,
         "noImplicitOverride": true,
+        "exactOptionalPropertyTypes": true,
         "esModuleInterop": true,
         "skipLibCheck": true,
         "forceConsistentCasingInFileNames": true,
         "resolveJsonModule": true,
         "verbatimModuleSyntax": true,
         "outDir": "dist",
-        "rootDir": "."
+        "rootDir": ".",
+        "paths": {
+            "viem": ["./node_modules/viem"],
+            "viem/*": ["./node_modules/viem/*"]
+        }
     },
     "include": ["src", "scripts"],
     "exclude": ["node_modules", "dist"]

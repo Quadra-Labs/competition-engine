@@ -1,202 +1,197 @@
 /**
- * Quadra Competition Engine — Express server.
+ * server.ts — the public read API.
  *
- * Authenticates agents over Socket.IO (Sui signatures), watches enrolment + creation events,
- * dispatches free jobs, scores them at lifetime end, records on-chain, and releases prizes. The
- * one HTTP write — `POST /competitions/:id/bind` — lets the create-competition CLI tell the
- * engine a competition's template + lifetime + portfolio (guarded by an operator token).
+ * Four routes, all GET, no authentication, no writes. The Sui service also carried a
+ * `PUT /competitions/:id/bind` guarded by an admin token, which is where a competition's title,
+ * template and portfolio were configured; that whole concept is gone, so the token, the
+ * constant-time compare and the `x-competition-admin` header went with it. What remains is a
+ * process that can only read the chain, which is the strongest thing that can be said about a
+ * service exposed to a browser.
+ *
+ * THE CACHE IS LOAD-BEARING, not an optimisation. Every list response is one log scan per
+ * competition against a rate-limited public RPC, and a dashboard polling every few seconds would
+ * otherwise turn one visitor into a sustained request storm. The Sui version cached for the same
+ * reason and had a cheaper backend.
  */
-import express from 'express';
-import { timingSafeEqual } from 'node:crypto';
-import { createServer } from 'node:http';
 
-import { loadCompetitionConfig, createDataLayer } from './config.js';
-import { createEvalEngineRegistry } from 'quadra-data';
-import { AuthManager } from './auth.js';
-import { createNotifier } from './notify.js';
-import { CompetitionEngine } from './engine.js';
-import type { CompetitionBinding } from './store.js';
+import express, { type Express, type Request, type Response } from 'express';
+import type { Server } from 'node:http';
+import type { Hex } from 'viem';
+import type { CompetitionDetail, CompetitionSummary } from './dto.js';
+import type { CompetitionReader } from './reader.js';
+import type { Registry, RegistryStats } from './registry.js';
 
-/** Constant-time token compare (avoids leaking the admin token via timing). */
-function tokenMatches(provided: string | undefined, expected: string): boolean {
-    if (!expected || !provided) return false;
-    const a = Buffer.from(provided);
-    const b = Buffer.from(expected);
-    return a.length === b.length && timingSafeEqual(a, b);
+/** How long a served read stays fresh. Long enough to absorb a polling dashboard. */
+const READ_TTL_MS = 5_000;
+
+export interface ServerDeps {
+    readonly registry: Registry;
+    readonly reader: CompetitionReader;
+    readonly chainId: number;
+    readonly sealedCompetition: string;
+    readonly corsOrigin: string;
+    readonly port: number;
+    readonly log?: (line: string) => void;
 }
 
-/** Validate + normalize the bind request body into a CompetitionBinding. */
-function parseBinding(id: string, body: unknown): CompetitionBinding | { error: string } {
-    if (body === null || typeof body !== 'object') return { error: 'body must be a JSON object' };
-    const b = body as Record<string, unknown>;
-    const kind = Number(b.kind);
-    if (kind !== 0 && kind !== 1) return { error: 'kind must be 0 (scoring) or 1 (performance)' };
-    if (typeof b.template_id !== 'string' || b.template_id.length === 0) {
-        return { error: 'template_id is required' };
-    }
-    if (typeof b.lifetime !== 'string' || b.lifetime.length === 0) {
-        return { error: 'lifetime is required' };
-    }
-    const endTime = Number(b.end_time_ms);
-    if (!Number.isFinite(endTime) || endTime <= 0) return { error: 'end_time_ms is required' };
+export interface RunningServer {
+    readonly app: Express;
+    readonly server: Server;
+    readonly close: (done: () => void) => void;
+}
 
-    const params =
-        b.params !== null && typeof b.params === 'object'
-            ? Object.fromEntries(
-                  Object.entries(b.params as Record<string, unknown>)
-                      .filter(([, v]) => typeof v === 'string')
-                      .map(([k, v]) => [k, v as string]),
-              )
-            : undefined;
-    const portfolio =
-        b.portfolio !== null && typeof b.portfolio === 'object'
-            ? Object.fromEntries(
-                  Object.entries(b.portfolio as Record<string, unknown>)
-                      .filter(([, v]) => typeof v === 'number' && Number.isFinite(v))
-                      .map(([k, v]) => [k, v as number]),
-              )
-            : undefined;
+const isBytes32 = (value: string): value is Hex => /^0x[0-9a-fA-F]{64}$/.test(value);
 
-    // Off-chain presentation + scheduling metadata (all optional).
-    const startTime = b.start_time_ms !== undefined ? Number(b.start_time_ms) : undefined;
-    if (startTime !== undefined && (!Number.isFinite(startTime) || startTime < 0)) {
-        return { error: 'start_time_ms must be a non-negative number' };
-    }
-    if (startTime !== undefined && startTime >= endTime) {
-        return { error: 'start_time_ms must be before end_time_ms' };
-    }
-    const str = (v: unknown): string | undefined =>
-        typeof v === 'string' && v.length > 0 ? v : undefined;
-    const finiteNum = (v: unknown): number | undefined =>
-        v !== undefined && Number.isFinite(Number(v)) ? Number(v) : undefined;
-    const split =
-        Array.isArray(b.split) && b.split.every((n) => Number.isFinite(Number(n)))
-            ? (b.split as unknown[]).map((n) => Number(n))
-            : undefined;
-    const prize = finiteNum(b.prize);
-    const threshold = finiteNum(b.threshold);
-
+/**
+ * A tiny TTL memo with in-flight de-duplication.
+ *
+ * Two details that look like fussiness and are not. The entry is stamped when the build FINISHES,
+ * not when it started: a build slower than the TTL would otherwise be stale the moment it lands,
+ * so every request rebuilds and the cache silently stops existing. And a build in progress is
+ * shared rather than started again, because the failure this cache exists to prevent is N
+ * concurrent viewers each launching their own full pass over the chain.
+ */
+function makeCache<T>(ttlMs: number) {
+    const store = new Map<string, { at: number; value: T }>();
+    const inFlight = new Map<string, Promise<T>>();
     return {
-        competition_id: id,
-        kind,
-        template_id: b.template_id,
-        lifetime: b.lifetime,
-        end_time_ms: endTime,
-        ...(params && Object.keys(params).length > 0 ? { params } : {}),
-        ...(portfolio && Object.keys(portfolio).length > 0 ? { portfolio } : {}),
-        ...(b.prediction === true ? { prediction: true } : {}),
-        ...(startTime !== undefined ? { start_time_ms: startTime } : {}),
-        ...(str(b.title) ? { title: str(b.title) } : {}),
-        ...(str(b.description) ? { description: str(b.description) } : {}),
-        ...(str(b.tag) ? { tag: str(b.tag) } : {}),
-        ...(prize !== undefined ? { prize } : {}),
-        ...(threshold !== undefined ? { threshold } : {}),
-        ...(split && split.length > 0 ? { split } : {}),
+        async get(key: string, build: () => Promise<T>): Promise<T> {
+            const hit = store.get(key);
+            if (hit !== undefined && Date.now() - hit.at < ttlMs) return hit.value;
+
+            const pending = inFlight.get(key);
+            if (pending !== undefined) return pending;
+
+            const promise = build()
+                .then((value) => {
+                    store.set(key, { at: Date.now(), value });
+                    return value;
+                })
+                .finally(() => inFlight.delete(key));
+            inFlight.set(key, promise);
+            return promise;
+        },
+        /** Drop entries nobody has asked for since the last sweep, so the map cannot grow forever. */
+        prune(): void {
+            const cutoff = Date.now() - ttlMs * 10;
+            for (const [key, hit] of store) if (hit.at < cutoff) store.delete(key);
+        },
     };
 }
 
-async function main(): Promise<void> {
-    const config = loadCompetitionConfig();
-    const dl = createDataLayer();
-    const evalEngines = createEvalEngineRegistry(dl);
-    await evalEngines.start();
-    const auth = new AuthManager(dl, config.authWindowMs);
-
+export function makeServer(deps: ServerDeps): RunningServer {
     const app = express();
-    app.use(express.json());
+    const listCache = makeCache<CompetitionSummary[]>(READ_TTL_MS);
+    const detailCache = makeCache<CompetitionDetail | undefined>(READ_TTL_MS);
+    const prune = setInterval(() => {
+        listCache.prune();
+        detailCache.prune();
+    }, 60_000);
+    prune.unref();
 
-    // Allow the web app to read the competition endpoints from the browser. Reads are public, so
-    // a permissive default origin is fine; tighten it with COMPETITION_CORS_ORIGIN in production.
-    const corsOrigin = process.env.COMPETITION_CORS_ORIGIN ?? '*';
-    app.use((req, res, next) => {
-        res.header('Access-Control-Allow-Origin', corsOrigin);
-        res.header('Access-Control-Allow-Headers', 'content-type, x-competition-admin');
-        res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
+    // Hand-rolled rather than the `cors` package: three headers, GET and OPTIONS only. The Sui
+    // version also allowed POST, PUT and the admin header, none of which exist here.
+    app.use((req: Request, res: Response, next) => {
+        res.setHeader('Access-Control-Allow-Origin', deps.corsOrigin);
+        res.setHeader('Access-Control-Allow-Headers', 'content-type');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
         if (req.method === 'OPTIONS') {
-            res.sendStatus(204);
+            res.status(204).end();
             return;
         }
         next();
     });
 
-    const httpServer = createServer(app);
-    const notifier = createNotifier(httpServer, auth);
-    const engine = new CompetitionEngine(dl, config, notifier, evalEngines);
-    engine.start();
-
-    // The create-competition CLI registers a competition's off-chain binding here.
-    app.put('/competitions/:id/bind', (req, res) => bindHandler(req, res));
-    app.post('/competitions/:id/bind', (req, res) => bindHandler(req, res));
-
-    function bindHandler(req: express.Request, res: express.Response): void {
-        if (!tokenMatches(req.header('x-competition-admin'), config.adminToken)) {
-            res.status(401).json({ error: 'unauthorized' });
-            return;
-        }
-        const id = req.params.id;
-        if (!id) {
-            res.status(400).json({ error: 'competition id is required' });
-            return;
-        }
-        const parsed = parseBinding(id, req.body);
-        if ('error' in parsed) {
-            res.status(400).json({ error: parsed.error });
-            return;
-        }
-        dl.jobTemplates
-            .get(parsed.template_id)
-            .then((template) => {
-                if (!template) {
-                    res.status(400).json({ error: `unknown template ${parsed.template_id}` });
-                    return;
-                }
-                return engine.bind(parsed).then(() => res.json({ ok: true }));
-            })
-            .catch((err) =>
-                res.status(500).json({ error: err instanceof Error ? err.message : 'bind failed' }),
-            );
-    }
-
-    app.get('/health', (_req, res) => res.json({ ok: true, network: dl.config.network }));
-    app.get('/status', (_req, res) => res.json(engine.status()));
-
-    // Public read API for the web competitions pages (list + detail).
-    app.get('/competitions', (_req, res) => {
-        engine
-            .listCompetitions()
-            .then((competitions) => res.json({ competitions }))
-            .catch((err) =>
-                res.status(500).json({ error: err instanceof Error ? err.message : 'list failed' }),
-            );
+    app.get('/health', (_req, res) => {
+        const stats: RegistryStats = deps.registry.stats();
+        // 200 even while a scan is failing: the process is up and serving what it has, and a health
+        // check that flaps with the public RPC teaches an operator to ignore it.
+        res.json({
+            ok: true,
+            chainId: deps.chainId,
+            sealedCompetition: deps.sealedCompetition,
+            competitions: stats.competitions,
+            tailing: stats.tailing,
+            indexedThroughBlock: stats.indexedThroughBlock,
+            lastScanAt: stats.lastScanAt,
+            ...(stats.lastScanError === undefined ? {} : { lastScanError: stats.lastScanError }),
+        });
     });
+
+    /** The successor of the Sui `/status`: service state, not an unbounded log of past work. */
+    app.get('/status', (_req, res) => {
+        res.json({
+            ...deps.registry.stats(),
+            uptimeSecs: Math.floor(process.uptime()),
+        });
+    });
+
+    app.get('/competitions', (_req, res) => {
+        void (async () => {
+            try {
+                const competitions = await listCache.get('all', async () => {
+                    const built: CompetitionSummary[] = [];
+                    // Serially, not in parallel: history comes from the index, but each entry
+                    // still costs two live contract reads, and firing every competition's reads at
+                    // once is how a list request returns 429s instead of competitions.
+                    for (const entry of deps.registry.list()) {
+                        const summary = await deps.reader.summary(entry);
+                        if (summary !== undefined) built.push(summary);
+                    }
+                    return built;
+                });
+                res.json({ competitions });
+            } catch (err) {
+                deps.log?.(`[competition] GET /competitions: ${message(err)}`);
+                res.status(502).json({ error: 'chain read failed', detail: message(err) });
+            }
+        })();
+    });
+
     app.get('/competitions/:id', (req, res) => {
-        const id = req.params.id;
-        if (!id) {
-            res.status(400).json({ error: 'competition id is required' });
-            return;
-        }
-        engine
-            .getCompetition(id)
-            .then((competition) => {
-                if (!competition) {
+        void (async () => {
+            const raw = req.params.id ?? '';
+            if (!isBytes32(raw)) {
+                res.status(400).json({ error: 'competition id must be 0x-prefixed 32-byte hex' });
+                return;
+            }
+            // Lowercased before it touches the index or the cache. Ids in the index come from
+            // decoded logs and are always lowercase, so a checksummed id from a link or a block
+            // explorer would miss and 404 a competition that is right there.
+            const id = raw.toLowerCase() as Hex;
+            try {
+                const detail = await detailCache.get(id, async () => {
+                    // The index answers instantly for anything it has seen; `discover` is the
+                    // fallback for a direct link to something below FROM_BLOCK or missed by a
+                    // failed scan.
+                    const entry = deps.registry.get(id) ?? (await deps.registry.discover(id));
+                    if (entry === undefined) return undefined;
+                    return deps.reader.detail(entry);
+                });
+                if (detail === undefined) {
                     res.status(404).json({ error: 'unknown competition' });
                     return;
                 }
-                res.json(competition);
-            })
-            .catch((err) =>
-                res.status(500).json({ error: err instanceof Error ? err.message : 'detail failed' }),
-            );
+                res.json(detail);
+            } catch (err) {
+                deps.log?.(`[competition] GET /competitions/${id}: ${message(err)}`);
+                res.status(502).json({ error: 'chain read failed', detail: message(err) });
+            }
+        })();
     });
 
-    httpServer.listen(config.port, () => {
-        console.log(
-            `[competition] listening on http://localhost:${config.port} (HTTP + Socket.IO)`,
-        );
+    const server = app.listen(deps.port, () => {
+        deps.log?.(`[competition] read API on :${deps.port}`);
     });
+
+    return {
+        app,
+        server,
+        close(done) {
+            clearInterval(prune);
+            server.close(() => done());
+        },
+    };
 }
 
-main().catch((error) => {
-    console.error('[competition] failed to start:', error);
-    process.exit(1);
-});
+const message = (err: unknown): string => (err instanceof Error ? err.message : String(err));

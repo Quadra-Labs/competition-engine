@@ -1,6 +1,10 @@
-node_modules/
+node_modules
+dist
+*.log
 
-# Local env (may hold a private key); keep the example tracked.
-.env
-.env.*
+# Local secrets / config (incl. .env.bak) — keep .env.example tracked.
+.env*
 !.env.example
+
+# Tests are local working tools, not shipped artifacts.
+test/
